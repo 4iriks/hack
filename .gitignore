@@ -1,0 +1,21 @@
+# Data (5GB+)
+Pre-train_Train/
+Pre-test_Test/
+main_data/
+features/
+models/
+submissions/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Errors
+errors/
+
+# Claude
+.claude/
