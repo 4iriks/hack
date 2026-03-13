@@ -95,6 +95,7 @@ def _clean_types(df: pl.DataFrame) -> pl.DataFrame:
             df = df.with_columns(pl.col(col).cast(pl.Int8, strict=False).fill_null(0))
     df = df.with_columns(
         pl.col('mcc_code').cast(pl.Int32, strict=False),
+        pl.col('session_id').cast(pl.Int64, strict=False),
         pl.col('battery').cast(pl.Float32, strict=False),
         pl.col('operaton_amt').fill_null(0.0),
         pl.col('phone_voip_call_state').fill_null(0),
@@ -108,6 +109,7 @@ def _clean_hist(df: pl.DataFrame) -> pl.DataFrame:
     df = _parse_dt(df)
     df = df.with_columns(
         pl.col('mcc_code').cast(pl.Int32, strict=False),
+        pl.col('session_id').cast(pl.Int64, strict=False),
         pl.col('operaton_amt').fill_null(0.0),
         pl.col('phone_voip_call_state').fill_null(0),
     )
@@ -144,23 +146,26 @@ def build_base_features(df: pl.DataFrame) -> pl.DataFrame:
 def build_history_features(df_hist: pl.DataFrame) -> pl.DataFrame:
     """Rolling/novelty/session фичи. df_hist уже отсортирован по [customer_id, event_dttm]."""
     t0 = time.time()
+    # Добавляем колонку единиц для подсчёта count через rolling_sum
+    df_hist = df_hist.with_columns(pl.lit(1.0).alias('_ones'))
     vel_cols = []
     for w in WINDOWS_SEC:
         vel_cols += [
             pl.col('operaton_amt')
-              .rolling_sum(window_size=w, by='event_dttm', closed='left')
+              .rolling_sum_by(by='event_dttm', window_size=w, closed='left')
               .over('customer_id').alias(f'amt_sum_{w}'),
-            pl.col('operaton_amt')
-              .rolling_count(window_size=w, by='event_dttm', closed='left')
-              .over('customer_id').cast(pl.Int32).alias(f'cnt_{w}'),
+            pl.col('_ones')
+              .rolling_sum_by(by='event_dttm', window_size=w, closed='left')
+              .over('customer_id').fill_null(0).cast(pl.Int32).alias(f'cnt_{w}'),
         ]
     vel_cols += [
         (
-            pl.col('event_dttm').dt.timestamp('s') -
-            pl.col('event_dttm').dt.timestamp('s').shift(1).over('customer_id')
+            (pl.col('event_dttm').dt.timestamp('ms') -
+             pl.col('event_dttm').dt.timestamp('ms').shift(1).over('customer_id'))
+            / 1000
         ).alias('secs_since_last'),
         pl.col('phone_voip_call_state')
-          .rolling_sum(window_size='24h', by='event_dttm', closed='left')
+          .rolling_sum_by(by='event_dttm', window_size='24h', closed='left')
           .over('customer_id').alias('voip_cnt_24h'),
     ]
     df_hist = df_hist.with_columns(vel_cols)
@@ -226,11 +231,17 @@ def build_train_features():
 
     N_CHUNKS = 32
     chunk_size = n_customers // N_CHUNKS + 1
+    tmp_dir = FEATURES_OUT / '_tmp_train'
+    tmp_dir.mkdir(exist_ok=True)
     log(f'Processing in {N_CHUNKS} chunks of ~{chunk_size:,} customers')
 
-    results = []
     for ci in range(0, n_customers, chunk_size):
         chunk_idx = ci // chunk_size + 1
+        tmp_path = tmp_dir / f'chunk_{chunk_idx:03d}.parquet'
+        if tmp_path.exists():
+            log(f'  Chunk {chunk_idx}/{N_CHUNKS}: already done — skip')
+            continue
+
         chunk_cids = all_cids[ci:ci + chunk_size]
         cid_set = set(chunk_cids.to_list())
         log(f'  Chunk {chunk_idx}/{N_CHUNKS}: {len(cid_set):,} customers')
@@ -276,19 +287,51 @@ def build_train_features():
         df_chunk = df_train_base.join(df_hist_feats, on='event_id', how='left')
         del df_train_base, df_hist_feats; gc.collect()
 
-        results.append(df_chunk)
+        # Сохраняем чанк на диск — освобождаем RAM
+        df_chunk.write_parquet(tmp_path)
         del df_chunk; gc.collect()
-        log(f'    chunk done, {_ram_gb():.1f}GB RAM')
+        log(f'    saved {tmp_path.name}, {_ram_gb():.1f}GB RAM')
+
+    # Собираем training-ready dataset: labeled + sampled nulls (по одному чанку)
+    # Вместо загрузки 85M строк — берём только ~344K нужных
+    log('Building training dataset from chunks...')
+    chunk_files = sorted(tmp_dir.glob('chunk_*.parquet'))
+    labels = pl.read_parquet(DATA / 'train_labels.parquet')
+    train_start = datetime(2024, 10, 1)
+
+    n_fraud = labels.filter(pl.col('target') == 1).height
+    n_null_target = n_fraud * 5
+
+    # Считаем общее число unlabeled для пропорционального семплирования
+    label_eids = set(labels['event_id'].to_list())
+    total_null = 0
+    for cf in chunk_files:
+        n = pl.scan_parquet(cf).filter(
+            pl.col('event_dttm') >= train_start
+        ).select(pl.len()).collect().item()
+        total_null += n
+    total_null -= len(labels)
+    frac = n_null_target / max(total_null, 1)
+    log(f'  fraud={n_fraud:,}  null_target={n_null_target:,}  frac={frac:.4f}')
+
+    results = []
+    for i, cf in enumerate(chunk_files):
+        df = pl.read_parquet(cf)
+        df = df.filter(pl.col('event_dttm') >= train_start)
+        df = df.join(labels.select(['event_id', 'target']), on='event_id', how='left')
+
+        labeled = df.filter(pl.col('target').is_not_null())
+        df_null = df.filter(pl.col('target').is_null())
+
+        n_sample = max(1, round(len(df_null) * frac))
+        null_sampled = df_null.sample(n=min(n_sample, len(df_null)), seed=42 + i)
+        null_sampled = null_sampled.with_columns(pl.lit(0).cast(pl.Int32).alias('target'))
+
+        results.append(pl.concat([labeled, null_sampled]))
+        del df, labeled, df_null, null_sampled; gc.collect()
 
     df_train = pl.concat(results)
     del results; gc.collect()
-
-    # Filter to train period + join labels
-    train_start = pl.lit('2024-10-01').str.to_datetime('%Y-%m-%d')
-    df_train = df_train.filter(pl.col('event_dttm') >= train_start)
-
-    labels = pl.read_parquet(DATA / 'train_labels.parquet')
-    df_train = df_train.join(labels.select(['event_id', 'target']), on='event_id', how='left')
     log(f'Train rows: {len(df_train):,}')
     log(f'Target dist:\n{df_train["target"].value_counts().sort("target")}')
 
@@ -321,11 +364,17 @@ def build_test_features():
 
     N_CHUNKS = 48
     chunk_size = n_customers // N_CHUNKS + 1
+    tmp_dir = FEATURES_OUT / '_tmp_test'
+    tmp_dir.mkdir(exist_ok=True)
     log(f'Processing in {N_CHUNKS} chunks of ~{chunk_size:,} customers')
 
-    results = []
     for ci in range(0, n_customers, chunk_size):
         chunk_idx = ci // chunk_size + 1
+        tmp_path = tmp_dir / f'chunk_{chunk_idx:03d}.parquet'
+        if tmp_path.exists():
+            log(f'  Chunk {chunk_idx}/{N_CHUNKS}: already done — skip')
+            continue
+
         cid_set = set(cid_list[ci:ci + chunk_size])
         log(f'  Chunk {chunk_idx}/{N_CHUNKS}: {len(cid_set):,} customers')
 
@@ -363,12 +412,18 @@ def build_test_features():
         df_chunk = df_test_base.join(df_hist_feats, on='event_id', how='left')
         del df_test_base, df_hist_feats; gc.collect()
 
-        results.append(df_chunk)
+        df_chunk.write_parquet(tmp_path)
         del df_chunk; gc.collect()
-        log(f'    chunk done, {_ram_gb():.1f}GB RAM')
+        log(f'    saved {tmp_path.name}, {_ram_gb():.1f}GB RAM')
 
-    df_test = pl.concat(results)
-    del results; gc.collect()
+    # Test — всего 633K строк, безопасно собрать в RAM
+    log('Assembling test chunks...')
+    chunk_files = sorted(tmp_dir.glob('chunk_*.parquet'))
+    parts = []
+    for cf in chunk_files:
+        parts.append(pl.read_parquet(cf))
+    df_test = pl.concat(parts)
+    del parts; gc.collect()
     log(f'Test features: {len(df_test):,}')
     df_test.write_parquet(test_feat_path)
     log(f'Saved → {test_feat_path}')
@@ -381,22 +436,14 @@ def build_test_features():
 
 def train_models():
     train_feat_path = FEATURES_OUT / 'train_features.parquet'
-    log('Loading train features...')
-    df = pl.read_parquet(train_feat_path)
+    log('Loading training dataset...')
+    df_dataset = pl.read_parquet(train_feat_path)
 
-    df_labeled = df.filter(pl.col('target').is_not_null())
-    df_null    = df.filter(pl.col('target').is_null())
-    log(f'Labeled: {len(df_labeled):,}  |  Null: {len(df_null):,}')
+    n_fraud = df_dataset.filter(pl.col('target') == 1).height
+    n_neg   = df_dataset.filter(pl.col('target') == 0).height
+    log(f'Dataset: {len(df_dataset):,}  fraud={n_fraud:,}  neg={n_neg:,}')
 
-    n_fraud       = df_labeled.filter(pl.col('target') == 1).height
-    n_null_sample = min(n_fraud * 5, len(df_null))
-    df_null_samp  = df_null.sample(n=n_null_sample, seed=42)
-    df_null_samp  = df_null_samp.with_columns(pl.lit(0).cast(pl.Int32).alias('target'))
-    df_dataset    = pl.concat([df_labeled, df_null_samp])
-    log(f'Dataset: {len(df_dataset):,}  fraud={n_fraud}  neg={df_dataset.filter(pl.col("target")==0).height}')
-    del df, df_null; gc.collect()
-
-    val_dt = pl.lit('2025-04-01').str.to_datetime('%Y-%m-%d')
+    val_dt = datetime(2025, 4, 1)
     df_tr  = df_dataset.filter(pl.col('event_dttm') < val_dt)
     df_val = df_dataset.filter(pl.col('event_dttm') >= val_dt)
     log(f'Train split: {len(df_tr):,}  |  Val: {len(df_val):,}')
