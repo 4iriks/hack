@@ -19,3 +19,4 @@ errors/
 
 # Claude
 .claude/
+catboost_info/
