@@ -1,12 +1,15 @@
-# Data (5GB+)
+# Raw data (5GB+)
 Pre-train_Train/
 Pre-test_Test/
 main_data/
 features/
+
+# Models (7GB+)
 models/
-submissions/
+models_v*/
 
 # Python
+.venv/
 venv/
 __pycache__/
 *.pyc
@@ -14,9 +17,7 @@ __pycache__/
 # Logs
 *.log
 
-# Errors
-errors/
-
-# Claude
+# IDE / tools
 .claude/
 catboost_info/
+errors/
