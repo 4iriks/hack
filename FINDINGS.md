@@ -36,6 +36,8 @@
 | v13-F | ??? | 0.044 | no top-5 leakers, 30K | запасной вариант |
 | v14-D | 0.0984 | — | anomaly+20K trees | 20K = переобучение |
 | v15-B | 0.0989 | 0.045 | 139 фич, 5K fixed iter | device+seq фичи |
+| v16-IPW20 | 0.1009 | 0.051 | 121 фич + IPW clip=20 | почти = рекорду! |
+| v16-IPW10 | 0.0981 | 0.050 | 121 фич + IPW clip=10 | val↑14.7% LB↓2.9% |
 | v15-A | 0.0981 | 0.045 | 121 фич, 5K fixed iter | fixed iter вредит! |
 
 ## Ключевые прорывы
@@ -788,3 +790,108 @@ AUC=1.0 делает веса экстремальными — нужен ост
 Ценные новые идеи: Focal Loss, двухстадийный подход (не как в v9).
 Главный вывод документа совпадает с нашим: pretest profiles = ключ к прорыву.
 Цифра "0.18" — завышена для LGBM-only подхода. Реалистичный потолок: 0.12-0.14.
+
+---
+
+## v16: Pretest Profiles + Drift + Z-score + IPW (2026-03-17/18)
+
+### Контекст
+v14-C (LB=0.1010, val=0.044) — рекорд. 121 фича (91 base + 30 anomaly).
+Цель v16: побить рекорд через борьбу с distribution shift (adversarial AUC=1.0).
+
+### Pretest Deep Profiles
+- Вычислены ПОЛНЫЕ deep profiles из pretest.parquet (14M строк, Jun-Aug'25)
+- 96,953 клиента, 39 колонок (тот же формат что deep_customer_profiles)
+- 91,058 клиентов с >=10 транзакциями (для hybrid)
+- Кэш: features/pretest_deep_profiles.parquet, features/pretest_mcc_profiles.parquet
+
+### Эксперимент v16-A: Hybrid Profiles (заменяем old → pretest)
+- **Подход**: anomaly features считаются от PRETEST profiles (вместо pretrain+train 177M)
+- Hybrid: pretest если >=10 tx, иначе fallback на old (91K + 9K)
+- **Результат**: val=0.04558 (ensemble), **но крайне нестабильно**
+- Seeds: 0.052, 0.034, 0.034, 0.047, 0.040 — iter от 547 до 9554!
+- **Причина**: pretest profiles на train данных (Oct-May) = temporal mismatch
+
+### Эксперимент v16-B: v14-C + 5 Pretest Anomaly Features (additive)
+- **Подход**: НЕ заменяем old profiles, а ДОБАВЛЯЕМ 5 новых фичей из pretest
+- pt_anom_amt_zscore, pt_anom_amt_vs_median, pt_anom_hour_zscore, pt_anom_mcc_novel, pt_anom_frequency
+- **Результат**: val=0.053538 (+21.7% vs v14-C), **LB=0.0965 (-4.5%!)**
+- Seeds стабильные: 0.051, 0.054, 0.053, 0.051, 0.051 — все 9.4K-10K iter
+- **ВЫВОД**: val↑ → LB↓. Pretest фичи = утечка через клиентов, помогает на val но вредит на LB
+
+### Эксперимент v16-C: v14-C + 3 Drift Features (additive)
+- drift_amt_mean_ratio, drift_frequency_ratio, drift_hour_shift
+- **Результат**: 1 seed done (val=0.053, iter=8980), процесс убит
+- Не завершён, но val аналогичен B → скорее всего тоже хуже на LB
+
+### Эксперимент v16-Z: Z-score нормализация velocity фичей по месяцу
+- **Подход**: ЗАМЕНЯЕМ velocity фичи (cnt_*, amt_sum_*, secs_since_last) на z-score по месяцу
+- Monthly stats вычислены из train, применены к train/val/test
+- **Результат**: крайне нестабильно! Seeds: 0.051, 0.031, 0.051 (3/5 done)
+- **Причина**: деревья не нуждаются в нормализации, z-score удаляет информацию
+- **ВЫВОД**: z-score velocity = вредно для LGBM
+
+### Эксперимент v16-IPW: Adversarial Importance-Weighted training
+- **Подход**: обучить adversarial (train=0 vs test=1), использовать P(test|x) для весов
+- Adversarial OOF AUC = 1.0 (идеальное разделение даже со слабой моделью)
+- Top shift features: dormancy_days, cum_unique_mcc_approx, month, day_of_month
+- P(test|train): mean=0.0015, max=0.53 — почти все train ~0, лишь единицы похожи на test
+- Weights после IPW: mean=1.0, std=0.51, min=0.985, max=108 (clip5)
+- **Результат**: в процессе (clip5: seeds 42=0.051, 123=0.044)
+
+### Ключевые выводы v16
+1. **Pretest profiles на val помогают (+22%), но на LB вредят (-4.5%)** — утечка через клиентов
+2. **Z-score velocity = вредно** для деревьев (удаляет информацию, не нуждаются в нормализации)
+3. **Adversarial IPW затруднён** при AUC=1.0: нет overlap → экстремальные/неинформативные веса
+4. **Distribution shift ПЕРВАСИВЕН и НЕУСТРАНИМ** на уровне фичей — возможно нужен другой подход
+5. **Правило "val↑ ≠ LB↑" подтверждено ещё раз** — pretest фичи = яркий пример
+
+### Финальные результаты v16-IPW (завершено)
+- Adversarial: 5-fold CV, weak model (15 leaves, max_depth=4, 100 trees, heavy reg)
+- OOF AUC = 1.0 (даже слабая модель идеально разделяет)
+- P(test|train): mean=0.0015, std=0.004, max=0.53
+- Weights после normalize: mean=1.0, std=0.51 (почти все ~1.0, единицы до 108)
+
+| Clip | Val PR-AUC | vs v14-C | Seed stability |
+|------|-----------|----------|----------------|
+| clip5 | 0.050130 | +13.9% | 0.039-0.055 (unstable) |
+| clip10 | 0.050474 | +14.7% | 0.044-0.053 |
+| clip20 | 0.051048 | +16.0% | 0.033-0.054 (most unstable!) |
+
+### LB результаты v16-IPW
+
+| Clip | Val PR-AUC | LB PR-AUC | vs v14-C (0.1010) |
+|------|-----------|-----------|-------------------|
+| clip10 | 0.0505 | **0.0981** | -2.9% |
+| clip20 | 0.0510 | **0.1009** | -0.1% (≈рекорд!) |
+
+**НЕОЖИДАННЫЙ РЕЗУЛЬТАТ**: clip20 практически равен рекорду!
+- Больший clip → лучше LB (обратная тенденция к val)
+- clip10: val +14.7% → LB -2.9%
+- clip20: val +16.0% → LB -0.1%
+- Тренд: clip↑ → LB↑ (при этом val меняется слабо)
+
+**ГИПОТЕЗА**: IPW с высоким clip агрессивнее перевешивает к test-подобным примерам.
+При AUC=1.0 это значит: единичные train примеры, случайно похожие на test, получают
+вес до 108×. С clip=20 максимальный вес ограничен 20×, с clip=10 — 10×.
+Парадокс: большая дисперсия весов (clip20) даёт лучший LB.
+
+### v16-IPW2: clip=50, clip=100 (завершено)
+
+### Полная таблица IPW (все clip values, с LB)
+
+| Clip | Val PR-AUC | LB PR-AUC | vs рекорд (0.1010) |
+|------|-----------|-----------|-------------------|
+| clip10 | 0.0505 | 0.0981 | -2.9% |
+| **clip20** | **0.0510** | **0.1009** | **-0.1% (≈рекорд)** |
+| clip50 | 0.0509 | 0.0992 | -1.8% |
+| clip100 | 0.0524 | 0.0980 | -3.0% |
+
+**ИТОГ IPW**: параболическая зависимость clip→LB. Clip20 = оптимум.
+- Слишком низкий clip (10): недостаточно перевешивает к test-подобным примерам
+- Оптимальный clip (20): баланс между shift-коррекцией и шумом весов
+- Слишком высокий clip (50, 100): единичные "test-подобные" примеры с весом 100× = шум
+- clip50 и clip100 фактически эквивалентны (реальный max weight = 103, оба не клипают)
+
+**ВЫВОД**: IPW с clip=20 даёт LB=0.1009 — на уровне рекорда v14-C, но НЕ лучше.
+IPW не способен побить рекорд при adversarial AUC=1.0. Стратегия исчерпана.

@@ -374,81 +374,98 @@ if __name__ == '__main__':
     log(f'RAM: {_ram_gb():.1f}GB')
 
     # ═══════════════════════════════════════════════════════
-    # EXP A: v14-C baseline (old profiles, 121 features)
-    # Reference point — should match v14-C val
+    # SEQUENTIAL EXPERIMENTS (no .clone() — save RAM)
+    # Skip baseline: v14-C already known (val=0.044, LB=0.101)
     # ═══════════════════════════════════════════════════════
-    log('\n>>> EXP A: v14-C BASELINE <<<')
-    train_a = v14.add_anomaly_features(train_df.clone(), old_deep_profs, old_mcc_profs)
-    val_a = v14.add_anomaly_features(val_df.clone(), old_deep_profs, old_mcc_profs)
 
-    base_feats = [c for c in v9.FEATURE_COLS if c in train_a.columns and c in val_a.columns]
-    anom_feats = [c for c in v14.ANOMALY_FEATURES if c in train_a.columns and c in val_a.columns]
+    # Add v14 anomaly features IN-PLACE (needed for all experiments)
+    log('\n>>> Adding v14 anomaly features <<<')
+    train_df = v14.add_anomaly_features(train_df, old_deep_profs, old_mcc_profs)
+    val_df = v14.add_anomaly_features(val_df, old_deep_profs, old_mcc_profs)
+    gc.collect()
+
+    base_feats = [c for c in v9.FEATURE_COLS if c in train_df.columns and c in val_df.columns]
+    anom_feats = [c for c in v14.ANOMALY_FEATURES if c in train_df.columns and c in val_df.columns]
     feats_a = base_feats + anom_feats
+    log(f'  v14-C feature set: {len(feats_a)} features')
 
-    X_tr_a = train_a.select(feats_a).to_pandas().astype(np.float32)
-    X_va_a = val_a.select(feats_a).to_pandas().astype(np.float32)
-    prauc_a, preds_a, _ = train_model('A_baseline', X_tr_a, y_train, X_va_a, y_val)
-    del X_tr_a, X_va_a; gc.collect()
+    results = {}
+    prauc_ref = 0.044  # v14-C val reference
 
-    # ═══════════════════════════════════════════════════════
-    # EXP B: v14-C + 5 pretest anomaly features (additive)
-    # Old profiles stay for v14 anomalies + pretest anomalies on top
-    # ═══════════════════════════════════════════════════════
+    # ── EXP B: v14-C + 5 pretest anomaly features ──
     log('\n>>> EXP B: + PRETEST ANOMALY FEATURES <<<')
-    train_b = add_pretest_anomaly_features(train_a.clone(), pretest_profs, pretest_mcc)
-    val_b = add_pretest_anomaly_features(val_a.clone(), pretest_profs, pretest_mcc)
+    train_df = add_pretest_anomaly_features(train_df, pretest_profs, pretest_mcc)
+    val_df = add_pretest_anomaly_features(val_df, pretest_profs, pretest_mcc)
 
-    pt_feats = [c for c in PRETEST_ANOMALY_FEATURES if c in train_b.columns and c in val_b.columns]
+    pt_feats = [c for c in PRETEST_ANOMALY_FEATURES if c in train_df.columns and c in val_df.columns]
     feats_b = feats_a + pt_feats
     log(f'  Features: {len(feats_a)} base+anom + {len(pt_feats)} pretest = {len(feats_b)}')
 
-    X_tr_b = train_b.select(feats_b).to_pandas().astype(np.float32)
-    X_va_b = val_b.select(feats_b).to_pandas().astype(np.float32)
-    prauc_b, preds_b, _ = train_model('B_plus_pretest', X_tr_b, y_train, X_va_b, y_val)
-    del X_tr_b, X_va_b, train_b, val_b; gc.collect()
+    X_tr = train_df.select(feats_b).to_pandas().astype(np.float32)
+    X_va = val_df.select(feats_b).to_pandas().astype(np.float32)
+    prauc_b, _, _ = train_model('B_plus_pretest', X_tr, y_train, X_va, y_val)
+    results['B_plus_pretest'] = prauc_b
+    del X_tr, X_va; gc.collect()
 
-    # ═══════════════════════════════════════════════════════
-    # EXP C: v14-C + 3 drift features (additive)
-    # Old profiles for anomalies + drift signal
-    # ═══════════════════════════════════════════════════════
+    # ── EXP C: v14-C + 3 drift features ──
     log('\n>>> EXP C: + DRIFT FEATURES <<<')
-    train_c = add_drift_features(train_a.clone(), pretest_profs, old_deep_profs)
-    val_c = add_drift_features(val_a.clone(), pretest_profs, old_deep_profs)
+    train_df = add_drift_features(train_df, pretest_profs, old_deep_profs)
+    val_df = add_drift_features(val_df, pretest_profs, old_deep_profs)
 
-    dr_feats = [c for c in DRIFT_FEATURES if c in train_c.columns and c in val_c.columns]
+    dr_feats = [c for c in DRIFT_FEATURES if c in train_df.columns and c in val_df.columns]
     feats_c = feats_a + dr_feats
     log(f'  Features: {len(feats_a)} base+anom + {len(dr_feats)} drift = {len(feats_c)}')
 
-    X_tr_c = train_c.select(feats_c).to_pandas().astype(np.float32)
-    X_va_c = val_c.select(feats_c).to_pandas().astype(np.float32)
-    prauc_c, preds_c, _ = train_model('C_plus_drift', X_tr_c, y_train, X_va_c, y_val)
-    del X_tr_c, X_va_c, train_c, val_c; gc.collect()
+    X_tr = train_df.select(feats_c).to_pandas().astype(np.float32)
+    X_va = val_df.select(feats_c).to_pandas().astype(np.float32)
+    prauc_c, _, _ = train_model('C_plus_drift', X_tr, y_train, X_va, y_val)
+    results['C_plus_drift'] = prauc_c
+    del X_tr, X_va; gc.collect()
 
-    # ═══════════════════════════════════════════════════════
-    # EXP D: Blended profiles (alpha-weighted pretest+old)
-    # Same 121 features but profiles are blended
-    # ═══════════════════════════════════════════════════════
+    # ── EXP BC: v14-C + pretest + drift (all additive) ──
+    log('\n>>> EXP BC: + PRETEST + DRIFT <<<')
+    feats_bc = feats_a + pt_feats + dr_feats
+    log(f'  Features: {len(feats_bc)} total')
+
+    X_tr = train_df.select(feats_bc).to_pandas().astype(np.float32)
+    X_va = val_df.select(feats_bc).to_pandas().astype(np.float32)
+    prauc_bc, _, _ = train_model('BC_pretest_drift', X_tr, y_train, X_va, y_val)
+    results['BC_pretest_drift'] = prauc_bc
+    del X_tr, X_va; gc.collect()
+
+    # Free old DataFrames, rebuild for D
+    del train_df, val_df; gc.collect()
+
+    # ── EXP D: Blended profiles (rebuild from scratch) ──
     log('\n>>> EXP D: BLENDED PROFILES <<<')
-    train_d = v14.add_anomaly_features(train_df.clone(), blended_profs, old_mcc_profs)
-    val_d = v14.add_anomaly_features(val_df.clone(), blended_profs, old_mcc_profs)
+    val_df_d = pl.read_parquet(FEATURES_IN / 'val_proper.parquet')
+    val_df_d = val_df_d.with_columns(
+        pl.col('event_id').is_in(fraud_ids).cast(pl.Int8).alias('is_fraud'))
+    val_df_d = v9.add_features(val_df_d)
+    val_df_d = v9.add_customer_profiles(val_df_d, old_profiles)
+    val_df_d = v14.add_anomaly_features(val_df_d, blended_profs, old_mcc_profs)
 
-    feats_d = [c for c in feats_a if c in train_d.columns and c in val_d.columns]
-    log(f'  Features: {len(feats_d)} (same as A but with blended profiles)')
+    train_df_d = pl.read_parquet(FEATURES_IN / 'train_features_full.parquet')
+    train_df_d = train_df_d.filter(~pl.col('event_id').is_in(val_ids))
+    train_df_d = v9.add_features(train_df_d)
+    train_df_d = v9.add_customer_profiles(train_df_d, old_profiles)
+    train_df_d = v14.add_anomaly_features(train_df_d, blended_profs, old_mcc_profs)
 
-    X_tr_d = train_d.select(feats_d).to_pandas().astype(np.float32)
-    X_va_d = val_d.select(feats_d).to_pandas().astype(np.float32)
-    prauc_d, preds_d, _ = train_model('D_blended', X_tr_d, y_train, X_va_d, y_val)
-    del X_tr_d, X_va_d, train_d, val_d, train_a, val_a; gc.collect()
+    feats_d = [c for c in feats_a if c in train_df_d.columns and c in val_df_d.columns]
+    log(f'  Features: {len(feats_d)} (same as v14-C but blended profiles)')
+
+    y_train_d = train_df_d['target'].to_numpy().astype(int)
+    y_val_d = val_df_d['is_fraud'].to_numpy().astype(int)
+    X_tr = train_df_d.select(feats_d).to_pandas().astype(np.float32)
+    X_va = val_df_d.select(feats_d).to_pandas().astype(np.float32)
+    prauc_d, _, _ = train_model('D_blended', X_tr, y_train_d, X_va, y_val_d)
+    results['D_blended'] = prauc_d
+    del X_tr, X_va, train_df_d, val_df_d; gc.collect()
 
     # ═══════════════════════════════════════════════════════
     # RESULTS
     # ═══════════════════════════════════════════════════════
-    results = {
-        'A_baseline': prauc_a,
-        'B_plus_pretest': prauc_b,
-        'C_plus_drift': prauc_c,
-        'D_blended': prauc_d,
-    }
+    results['A_baseline_ref'] = prauc_ref  # v14-C known value
 
     log(f'\n{"="*60}')
     log('ИТОГИ V16 ABLATION')
@@ -456,24 +473,24 @@ if __name__ == '__main__':
 
     sorted_res = sorted(results.items(), key=lambda x: -x[1])
     for name, prauc in sorted_res:
-        delta = 100 * (prauc / prauc_a - 1)
+        delta = 100 * (prauc / prauc_ref - 1)
         marker = ' <<<' if prauc == sorted_res[0][1] else ''
-        log(f'{name:25s}: val={prauc:.6f} ({delta:+.1f}% vs baseline){marker}')
+        log(f'{name:25s}: val={prauc:.6f} ({delta:+.1f}% vs v14-C ref){marker}')
 
-    # Save results
     with open(MODELS_OUT / 'results_v16.json', 'w') as f:
         json.dump(results, f, indent=2)
 
-    # Generate submissions for ALL experiments (LB is the real test, not val)
-    log('\n=== ГЕНЕРАЦИЯ САБМИТОВ (все 4 для LB-выводов) ===')
+    # Generate submissions for trained experiments
+    log('\n=== ГЕНЕРАЦИЯ САБМИТОВ ===')
     feat_map = {
-        'A_baseline': feats_a,
         'B_plus_pretest': feats_b,
         'C_plus_drift': feats_c,
+        'BC_pretest_drift': feats_bc,
         'D_blended': feats_d,
     }
     for name, prauc in sorted_res:
-        generate_submission(name, feat_map[name])
+        if name in feat_map:
+            generate_submission(name, feat_map[name])
 
     total_min = (time.time() - t_start) / 60
     log(f'\nВсего: {total_min:.0f} мин')
