@@ -7,8 +7,10 @@
 Test = последний случайный день каждого клиента (633,683 ops).
 LB: public=30% (недели 1,3,5), private=70% (остальные 7 недель).
 
-## Текущее состояние (2026-03-17)
+## Текущее состояние (2026-03-19)
 - Лучший LB: **0.1010** (pipeline_v14-C, 121 фич, early stopping)
+- v18 (honest point-in-time): val=0.0439, LB=0.0944 (-6.5%, mismatch)
+- v18b (hybrid: v14-C + honest dormancy + test fix): val=0.0492, 5 seeds, submit ready, ожидает LB
 - Потолок текущего подхода (LGBM + 121 фич): ~0.101
 - Реалистичный потенциал с новыми стратегиями: 0.12-0.14
 - Kaggle API подключён (KGAT токен в ~/.bashrc)
@@ -17,6 +19,8 @@ LB: public=30% (недели 1,3,5), private=70% (остальные 7 неде�
 | Submit | PR-AUC | Strategy | Notes |
 |--------|--------|----------|-------|
 | **v14-C** | **0.1010** | **base+anomaly 121 фич, ES** | **РЕКОРД** |
+| v18 | 0.0944 | honest PIT profiles, 121 фич | val≈v14-C, LB-6.5% mismatch |
+| v18b | ??? | v14-C + honest dormancy + test fix | val=0.049, ожидает LB |
 | v16-B | 0.0965 | +5 pretest anom фич, 126 total | val↑21% LB↓4.5% |
 | v15-B | 0.0989 | 139 фич, 5K fixed iter | device+seq, fixed iter вредит |
 | v14-D | 0.0984 | anomaly+20K trees | 20K = переобучение |
@@ -45,23 +49,27 @@ LB: public=30% (недели 1,3,5), private=70% (остальные 7 неде�
 3. НЕ customer boost — утечка, -6.5% на LB
 4. НЕ labeled-only — 0.068, провал
 5. НЕ больше 10K деревьев — переобучение на shift
-6. Val ≠ LB: val↑ часто → LB↓ (кроме time-invariant фич)
+6. Val ≠ LB: val↑ часто → LB↓ (частично из-за temporal leakage в prof_*/anom_*)
 7. Time-invariant per-customer фичи — единственный подтверждённый прирост на LB
 8. Базовая стратегия: labeled+green (fraud vs confirmed+sampled_normal)
 9. НЕ pretest-based фичи — val↑21% но LB↓4.5%, утечка через клиентов (v16-B)
 10. НЕ z-score velocity — деревья не нуждаются в нормализации, ломает фичи (v16-Z)
 11. IPW: clip20=0.1009 (≈рекорд), clip10=0.0981, clip50=0.0992, clip100=0.0980. Парабола: clip20=оптимум, выше/ниже хуже
+12. TEMPORAL LEAKAGE: deep profiles (prof_*, anom_*) из 177M ops содержат будущее для val. Честный val=0.031 vs утёкший=0.044 (-30%). cust_* чистые (pretrain only)
+13. HONEST PIT (v18): LB=0.0944 (-6.5% vs v14-C). Причина: train на аппроксимациях (median≈mean), test на точных profiles → mismatch. Leaked фичи ближе к test по распределению
 
 ## Доказанные факты
 - Distribution shift: adversarial AUC=1.0 между train/test
 - dormancy_days: shift=2.13σ, 98.8% adversarial importance
 - Shift ПЕРВАСИВНЫЙ: удаление/нормализация/IPW фич не помогает
 - Customer-level PR-AUC=0.214 vs transaction-level=0.039
-- Калибровка val→LB стабильна: коэффициент ~2.3
 - battery = -1.0 во ВСЕХ preprocessed строках (бесполезен)
 - RDP×VoIP = 0 случаев в train
 - Pretest profiles: val+22% но LB-4.5% (утечка, доказано v16-B)
 - Top shift features (adversarial): dormancy_days, cum_unique_mcc, month, day_of_month, session_amt
+- **TEMPORAL LEAKAGE в deep profiles**: prof_* и anom_* считались по pretrain+train (177M ops). Val-транзакция в ноябре "видит" профиль до мая = утечка. Честный val = 0.031 vs утёкший 0.044 (-30%). cust_* чистые (pretrain only). Скрипт: analytics/02_honest_val.py
+- **v18 PIT: LB=0.0944 (-6.5%)**: честные PIT-аппроксимации при обучении + точные deep profiles на test = mismatch. Leaked фичи парадоксально лучше для LB — они ближе к test-распределению
+- **dormancy_days в v14-C СЛОМАНА**: формула event_dttm - cust_last_epoch(pretrain) даёт ~129 дней (константа на клиента). Honest dormancy (shift(1)) = 0.3 дня (реальный интервал). Quick test +13.5% val. Но test dormancy тоже нужно пересчитать (старая = 270+ дней)
 
 ## Что не работает в данных
 - battery (все -1.0), compromised (все null), developer_tools (все null)
@@ -69,13 +77,22 @@ LB: public=30% (недели 1,3,5), private=70% (остальные 7 неде�
 - Device "фермы" (0.4% importance), pos_cd downgrade (0.0% importance)
 - Sequence features (0.1-0.7% importance, 0 прирост LB)
 
-## План v16+ (приоритеты)
-1. **Pretest profiles + drift фичи** — пересчёт customer profiles из 14M pretest (Jun-Aug'25 = эпоха теста)
-2. **Z-score нормализация по месяцу** — убирает temporal shift из velocity фичей
-3. **Red vs Yellow score как фича** — LGBM на 87K (fraud vs confirmed), predict как доп. фича
-4. **Adversarial IPW clipped** — w=p/(1-p), clip max=10-20, борьба с shift через веса
-5. **Focal Loss** — custom objective для LGBM, фокус на hard examples
-6. **Двухстадийный** — green-vs-notgreen → red-vs-yellow (НЕ как v9!)
+## Что осталось попробовать
+1. **v18b hybrid** — ЗАВЕРШЕНО: val=0.0492, test dormancy fix (279→2 days), submit ready, ожидает LB
+2. **LambdaRank** — ranking objective вместо binary CE (начато, не завершено)
+3. **Focal Loss** — custom objective для hard examples (начато, не завершено)
+4. **Другое ratio негативов** — 10:1, 20:1, 100:1 вместо 50:1
+5. **Стекинг разных "взглядов"** — velocity-only + anomaly-only + profile-only → мета-модель
+6. **Трансформер** — LBSF на последовательностях клиентов (Kaggle P100)
+
+## Исчерпанные подходы (v16-v18)
+- Pretest profiles: val+21% LB-4.5% (утечка)
+- Z-score velocity: вредит деревьям
+- **Honest PIT profiles (v18)**: val=0.044 (≈v14-C), LB=0.094 (-6.5%). Аппроксимации train↔test mismatch
+- IPW: clip20=0.1009 (≈рекорд, не лучше), парабола clip10-100
+- Blend v14-C + IPW: бесполезен (val≠LB)
+- Red vs Yellow фича: val ХУЖЕ baseline
+- Drift features: не завершено, скорее всего вредит
 
 ## Инфраструктура
 - Локально: 32GB RAM, RTX 3080 Ti 12GB, LGBM GPU ~10мин/seed
@@ -94,7 +111,7 @@ LB: public=30% (недели 1,3,5), private=70% (остальные 7 неде�
 - Pre-test_Test/ — pretest.parquet (14M, Jun-Aug'25) + test.parquet (633K)
 - features/ — кэши: train_features_full (2.6M), val_proper (523K), test_features (633K),
   customer_profiles, deep_customer_profiles, customer_mcc_profiles, pretest_profiles,
-  device_graph, prev_tx_lookup, _tmp_train/ (32 чанка)
+  device_graph, prev_tx_lookup, honest_pit_profiles, _tmp_train/ (32 чанка)
 - models_v*/ — сохранённые модели
 - submissions/ — CSV для LB
 
@@ -103,6 +120,14 @@ LB: public=30% (недели 1,3,5), private=70% (остальные 7 неде�
 - pipeline_v10.py — proper val + baseline LGBM (LB=0.097)
 - pipeline_v9.py — add_features() и FEATURE_COLS (91 фича)
 - pipeline_v15.py — device+sequence эксперименты (не помогло)
+- v16_ipw.py / v16_ipw2.py — IPW эксперименты (clip5-100)
+- v17_experiments.py — blend + RvY + focal loss
+- v17_lambdarank.py — LambdaRank эксперимент
+- v18_honest_features.py — Point-in-Time честные фичи, val=0.0439, chunked 87M rows
+- v18b_hybrid_test.py — Гибрид: v14-C profiles + honest dormancy + test dormancy fix
+- analytics/01_fundamentals.ipynb — фундаментальный аудит пайплайна
+- analytics/02_honest_val.py — пересчёт профилей без temporal leakage, доказательство утечки -30%
+- analytics/feature_analysis.md — справочник всех 121 фичей + данные для графиков
 - FINDINGS.md — полный лог всех экспериментов
 - REPORT.md — сводный отчёт проекта
 

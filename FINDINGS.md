@@ -39,6 +39,8 @@
 | v16-IPW20 | 0.1009 | 0.051 | 121 фич + IPW clip=20 | почти = рекорду! |
 | v16-IPW10 | 0.0981 | 0.050 | 121 фич + IPW clip=10 | val↑14.7% LB↓2.9% |
 | v15-A | 0.0981 | 0.045 | 121 фич, 5K fixed iter | fixed iter вредит! |
+| v18 | 0.0944 | 0.044 | honest PIT profiles | train/test mismatch |
+| v18b | ??? | 0.049 | v14-C + honest dormancy + test fix | ожидает LB |
 
 ## Ключевые прорывы
 
@@ -895,3 +897,265 @@ v14-C (LB=0.1010, val=0.044) — рекорд. 121 фича (91 base + 30 anomal
 
 **ВЫВОД**: IPW с clip=20 даёт LB=0.1009 — на уровне рекорда v14-C, но НЕ лучше.
 IPW не способен побить рекорд при adversarial AUC=1.0. Стратегия исчерпана.
+
+---
+
+## v17: Blend + Red vs Yellow + Focal Loss + LambdaRank (2026-03-18)
+
+### Контекст
+v16 исчерпал подходы shift-коррекции. v17 — принципиально другие подходы.
+
+### Exp A: Blend v14-C + IPW_clip20
+- v14-C val: 0.044314, IPW_clip20 val: 0.051048
+- Оптимальный blend: w_v14c = **0.00** (на val IPW лучше → blend бесполезен)
+- 50/50 blend: val=0.048482
+- Geometric rank blend: val=0.047616
+- **Парадокс**: на LB v14-C лучше (0.1010 vs 0.1009), но val говорит обратное
+- Вывод: блэнд бессмыслен когда val не коррелирует с LB
+
+### Exp B: Red vs Yellow score как фича
+- Обучение fraud vs confirmed (87K): OOF AUC = **0.9409**
+- RvY скор: train mean=0.44, val mean=0.45, test mean=0.43 (распределения похожи!)
+- Seed 42: val=0.036 (ХУЖЕ baseline 0.044)
+- **LGBM GPU crash** при 122 фичах: "Check failed: best_split_info.left_count > 0"
+- Переключили на CPU — seed 42 val=0.036, остальные не завершены (процесс убит)
+- **Предварительный вывод**: RvY фича ВРЕДИТ — модель путается от дополнительного скора
+
+### Exp C: Focal Loss — НЕ ЗАВЕРШЁН (crash на Exp B остановил пайплайн)
+
+### Exp D: LambdaRank — НЕ ЗАВЕРШЁН (процесс убит пользователем)
+
+### Ключевой вывод v17
+Все четыре подхода либо не работают, либо не завершены. Это подтверждает:
+1. Blend бесполезен когда val≠LB
+2. Дополнительные фичи (RvY) вредят (подтверждено в 5-й раз)
+3. Нужен принципиально другой подход (не LGBM + фичи)
+
+---
+
+## Фундаментальный аналитический аудит (2026-03-18)
+
+### 1. Validation Strategy
+- Train: 2024-10-01 → 2025-05-31 (2.66M строк, 50:1 sample)
+- Val: из того же периода, 1 день/клиент (523K строк, 430 fraud = 0.082%)
+- Test: 2025-06-01 → 2025-08-09 (633K строк)
+- **Gap train→test: 0 дней** (test начинается на следующий день после train)
+- **Клиенты: 100% overlap** между train/val/test (94K из 94K)
+- **ПРОБЛЕМА**: val из train-периода, test из другого → distribution shift не улавливается
+
+### 2. Label Engineering
+- 🔴 Fraud: 51,438 (1.93% train) — target=1
+- 🟡 Confirmed: 36,076 (1.36%) — target=0 (вместе с green)
+- 🟢 Green: 2,571,884 (96.71%) — target=0
+- Ratio neg/pos = 50.7:1, scale_pos_weight = 50.0
+- Fraud суммы значительно выше (median ~24K vs ~5K green)
+
+### 3. Feature Importance v14-C (LB=0.1010)
+| # | Feature | Gain % | Category |
+|---|---------|--------|----------|
+| 1 | anom_hourly_burst | 6.41% | anomaly |
+| 2 | mcc_code | 3.52% | other |
+| 3 | prof_gap_std | 3.16% | profile |
+| 4 | amt_ratio_7d_30d | 2.61% | velocity |
+| 5 | amt_sum_1h | 2.61% | velocity |
+| 6 | dormancy_days | 2.22% | customer |
+| 7 | event_desc | 2.18% | other |
+| 8 | anom_daily_velocity | 2.04% | anomaly |
+| 9 | prof_hour_entropy | 1.92% | profile |
+| 10 | prof_gap_mean | 1.90% | profile |
+
+- Топ-10: 28.6% gain, Топ-20: 44.8%, Нижние 50: 8.9%
+- Нет утечки (customer_id/event_id не в фичах)
+- **anom_hourly_burst** (#1) — новая фича v14, подтверждает ценность per-customer anomaly
+
+### 4. Val vs LB корреляция
+- **Слабая корреляция**: val↑ → LB↓ в большинстве случаев
+- v14-C (val=0.044, LB=0.101, ratio=2.30) — единственная с хорошим ratio
+- Модели с высоким val (v14-D 0.055, v16-B 0.054) имеют ХУДШИЙ LB
+- **Вывод: оптимизация val бессмысленна** — нужна другая метрика для отбора моделей
+
+### 5. Visualizations (analytics/)
+- `val_strategy_dates.png` — train и val из одного периода
+- `label_amounts.png` — fraud суммы выше confirmed и green
+- `feature_importance_v14c.png` — топ фичи + pie по категориям
+- `metrics_val_vs_lb.png` — scatter val/LB + PR-кривая
+- `fraud_temporal.png` — fraud rate по месяцам, дням, часам
+
+### 6. КРИТИЧЕСКАЯ НАХОДКА: Temporal Leakage в профилях (2026-03-18)
+
+**Проблема:** `deep_customer_profiles` (prof_*, anom_*) считались по ВСЕМ 177M ops (pretrain Oct'23 + train Oct'24-May'25). Val-транзакция в ноябре 2024 "видит" профиль клиента с данными до мая 2025 = **утечка из будущего**. На тесте (Jun-Aug'25) такой утечки нет — профиль честно заканчивается на мае.
+
+**Уточнение:** `customer_profiles` (cust_*) считались только по pretrain (Oct'23-Sep'24) → **без утечки**. Утечка только в prof_* (12 шт) и anom_* (18 шт) = 30 из 121 фичи. Но среди них — #1 importance `anom_hourly_burst` (6.41%).
+
+**Эксперимент (02_honest_val.py):**
+Пересчитали deep profiles для каждого клиента, используя ТОЛЬКО данные ДО его val-даты. Прогнали ту же модель v14-C.
+
+```
+Val PR-AUC (утёкшие профили):  0.0443
+Val PR-AUC (честные профили):  0.0311   ← -29.8%
+Ratio LB/Leaked:               2.28
+Ratio LB/Honest:               3.25
+```
+
+**Помесячная разбивка:**
+```
+2024-10: leaked=0.0228  honest=0.0125  diff=-45.4%  (7 мес будущего утекло)
+2024-11: leaked=0.0609  honest=0.0321  diff=-47.3%  (6 мес)
+2024-12: leaked=0.0379  honest=0.0212  diff=-44.1%  (5 мес)
+2025-01: leaked=0.0623  honest=0.0475  diff=-23.8%  (4 мес)
+2025-02: leaked=0.0792  honest=0.0800  diff=+1.0%   (3 мес — почти нет эффекта)
+2025-03: leaked=0.0304  honest=0.0118  diff=-61.2%  (2 мес)
+2025-04: leaked=0.0789  honest=0.0609  diff=-22.9%  (1 мес)
+2025-05: leaked=0.0305  honest=0.0279  diff=-8.4%   (0 мес — минимум утечки)
+```
+
+**Выводы:**
+1. Утечка раздувает val на ~30%
+2. Чем раньше месяц val-транзакции — тем сильнее раздувка (Oct/Nov: -45%)
+3. Это объясняет паттерн val↑ → LB↓: модель оптимизируется на утёкшие паттерны
+4. Для честной val-метрики нужно переобучать модель на честных профилях
+5. Скрипт: `analytics/02_honest_val.py` (6.4 мин, обработка 177M строк)
+
+### 7. V18: Point-in-Time честные фичи (2026-03-19)
+
+**Задача:** Полностью устранить temporal leakage — для каждой train-транзакции считать профиль клиента ТОЛЬКО из данных ДО секунды этой транзакции.
+
+**Подход:**
+1. **Pretrain Base** (90M ops, Oct'23-Sep'24): полная агрегация по клиентам (сумма, сумма², мин, макс, кол-во и т.д.) — всегда "прошлое" для любой train-строки
+2. **Train Cumulative** (87M ops, Oct'24-May'25): сортировка по (customer_id, epoch), cum_sum + shift(1) — кумулятивно до текущей строки, не включая её
+3. **Point-in-Time Profile** = pretrain_base + train_cumulative
+4. **Фильтрация**: из 87M → 3.17M нужных строк (train 2.64M + val 523K)
+5. **Derive prof_\* и anom_\*** из inline профилей (без JOIN)
+6. **LGBM** 5 seeds, GPU, early stopping на val
+
+**Аппроксимации** (необходимы для кумулятивного подхода):
+- Median ≈ mean, P95 ≈ mean+1.645×std, P99 ≈ mean+2.326×std, IQR ≈ 1.35×std
+- Entropy ≈ log2(n_unique) вместо Shannon
+- MCC per-category: pretrain only (90M ops)
+
+**Honest dormancy_days:**
+- Если есть предыдущая train-транзакция: `(epoch - prev_train_epoch) / 86400`
+- Если первая train-транзакция: `(epoch - pretrain_last_epoch) / 86400`
+- Если клиент-новичок без pretrain: `dormancy = 0`
+
+**Критическая граница:** Первая транзакция клиента в Oct 2024 → профиль = строго pretrain_base (shift(1) даёт null → fill_null(0) → pretrain_base + 0).
+
+**Memory-safe:** 87M строк чанкуются по 20 групп × 5K клиентов (~4.3M строк/чанк). RAM пик = 22GB (vs >25GB без чанков = OOM).
+
+**Результаты:**
+```
+Val PR-AUC по сидам:
+  Seed 42:    iter=9974,  val=0.046447
+  Seed 123:   iter=2692,  val=0.036538
+  Seed 777:   iter=9938,  val=0.047566
+  Seed 2024:  iter=3297,  val=0.037082
+  Seed 31337: iter=3444,  val=0.037013
+
+Ensemble Val PR-AUC: 0.043887
+
+Сравнение:
+  v14-C (leaked profiles):              val=0.0443  LB=0.1010
+  v18 (honest features, leaked model):  val=0.0311  (analytics/02_honest_val.py)
+  v18 (honest features, honest model):  val=0.0439  ← переобучение восстановило!
+```
+
+**Ключевые наблюдения:**
+1. **Переобучение на честных фичах восстанавливает val** с 0.031 до 0.044 (≈v14-C leaked)
+2. Огромный разброс сидов: 0.037-0.048 — honest val нестабильна
+3. Сиды с ~10K итерациями (42, 777) дают val~0.047, с ~3K итерациями — val~0.037
+4. Для test: используются ПОЛНЫЕ deep profiles (честные — все данные до test)
+
+**LB результат: 0.0944** (-6.5% vs v14-C рекорд 0.1010)
+
+```
+v14-C: val=0.0443  LB=0.1010  ratio=2.28
+v18:   val=0.0439  LB=0.0944  ratio=2.15
+```
+
+**Причина деградации — train↔test feature mismatch:**
+- Train: аппроксимированные PIT-профили (median≈mean, p95≈mean+1.645×std, IQR≈1.35×std)
+- Test: точные deep profiles (настоящие медианы, p95, IQR, Shannon entropy)
+- LGBM обучился на одном распределении фичей, а предсказывает на другом
+- Ранние train-транзакции (Oct'24) имеют мало кумулятивной истории → шумные фичи
+
+**Парадокс leakage:**
+- Leaked train-фичи (v14-C) = точные профили по 177M ops → БЛИЖЕ по распределению к test-фичам
+- Honest PIT-фичи (v18) = аппроксимации кумулятивных статистик → ДАЛЬШЕ от test-фичей
+- Устранение leakage сделало val честнее, но модель хуже из-за mismatch
+
+**Итоговый вывод:** Temporal leakage в val раздувал метрику, но НЕ вредил test-предсказаниям. "Утёкшие" фичи ближе к test по распределению. Фикс leakage в данном подходе (кумулятивные аппроксимации) контрпродуктивен для LB.
+
+**Сабмит:** `submissions/submit_v18_honest_20260319_0223.csv`
+**Время:** 67 мин (Phase 1: 16с, Phase 2: 2мин чанки, Phase 4: 62мин LGBM)
+**Скрипт:** `v18_honest_features.py`
+
+### 8. V18b: Hybrid — v14-C profiles + honest dormancy (2026-03-19)
+
+**Идея:** Вместо замены ВСЕХ профилей на PIT-аппроксимации (v18), оставить "жирные" deep profiles (как v14-C) и заменить только одну фичу: `dormancy_days`.
+
+**Диагностика проблемы dormancy_days в v14-C:**
+```
+Текущая формула: dormancy = event_dttm - cust_last_epoch(pretrain) / 86400
+  → cust_last_epoch = последняя pretrain-транзакция (Sep 2024)
+  → Для ВСЕХ train-транзакций одного клиента dormancy ≈ 130-240 дней
+  → По сути КОНСТАНТА на клиента — бесполезна для обнаружения фрода
+
+Honest формула: dormancy = event_dttm - previous_transaction_dttm / 86400
+  → shift(1) в отсортированных по (customer_id, epoch) данных
+  → Реальный межтранзакционный интервал: 0.01-30 дней
+  → Настоящий поведенческий сигнал
+```
+
+**Статистика:**
+- Train dormancy: old mean=129.1 days → honest mean=0.3 days
+- Качественное отличие: константа → динамическая фича
+
+**Quick test (2 seeds: 42, 777):**
+```
+v14-C baseline:     val=0.0443
+v18b hybrid (2s):   val=0.0503  (+13.5%!)
+  Seed 42:  iter=9997, val=0.0509
+  Seed 777: iter=7650, val=0.0480
+```
+dormancy_days importance: rank #58/121, 0.64% — скромно по importance, но val↑13.5%
+
+**Вторая проблема: test dormancy distribution shift:**
+```
+Train honest dormancy: mean=0.3 дня (реальные интервалы)
+Test old dormancy:     mean=270+ дней (от Sep 2024 pretrain)
+→ Модель обучилась на 0.3 дня, видит 270 дней → сплиты не работают
+```
+
+**Решение для test:** Lookup-таблица last_known_epoch:
+1. Для каждого customer_id: max(epoch) из pretrain + train + pretest
+2. pretest фильтруется: epoch < начало test-дня клиента (чтобы не заглянуть в будущее)
+3. Приоритет: pretest > train > pretrain (самая свежая транзакция)
+4. Test dormancy = (test_epoch - last_known_epoch) / 86400
+5. Новички без истории → dormancy = 0 (как в train)
+
+**Full pipeline (5 seeds) — ЗАВЕРШЕНО:**
+```
+  Seed 42:    iter=6139,  val=0.045341
+  Seed 123:   iter=9993,  val=0.051381
+  Seed 777:   iter=9847,  val=0.051141
+  Seed 2024:  iter=5253,  val=0.044880
+  Seed 31337: iter=5639,  val=0.043661
+  ─────────────────────────────────
+  Ensemble 5 seeds: val=0.049156
+```
+
+**Test dormancy fix результаты:**
+- Test dormancy sources: pretest=91,611 клиентов, train/pretrain=2,630
+- Test dormancy: mean=1.98 days (was 279.5 → fix -99.3%)
+- Distribution shift устранён: train mean=0.3, test mean=2.0 (реалистичное различие)
+
+**Сабмит:** `submissions/submit_v18b_hybrid_20260319_1527.csv`
+**Ensemble val PR-AUC: 0.0492** | Время: 34.8 мин
+
+**Сравнение quick test vs full run:**
+- Quick (2 seeds, no test fix): val=0.0503
+- Full (5 seeds, +test dormancy fix): val=0.0492
+
+**Вывод:** v18b hybrid = v14-C profiles + honest dormancy + test dormancy fix. Val=0.049 (+11% vs v14-C val=0.044). Ожидаемый LB зависит от того, насколько dormancy fix поможет на реальном тесте. Потенциально LB≥0.101 если fix сработает.
+
+**Скрипт:** `v18b_hybrid_test.py`
